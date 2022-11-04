@@ -1,0 +1,172 @@
+#!/usr/bin/env groovy
+
+properties([
+    [$class: 'JiraProjectProperty', siteName: 'https://jira.contoso.com/'],
+    [$class: 'RebuildSettings', autoRebuild: false, rebuildDisabled: false],
+    buildDiscarder(logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '14', numToKeepStr: '30')),
+    [$class: 'JobRestrictionProperty'],
+    parameters([
+        [$class: 'CascadeChoiceParameter',
+            choiceType: 'PT_RADIO',
+            description: 'Choice the service',
+            filterLength: 1,
+            filterable: true,
+            name: 'service',
+            script: [$class: 'GroovyScript',
+                fallbackScript: [classpath: [],
+                    sandbox: false,
+                    script: ''],
+                script: [classpath: [],
+                    sandbox: false,
+                    script: '''
+                        return[
+                            'php-app-1:selected',
+                            'php-app-2',
+                            'java-app-1',
+                            'java-app-2'
+                        ]
+                    '''
+                ]
+            ]
+        ],
+        [$class: 'CascadeChoiceParameter',
+            choiceType: 'PT_SINGLE_SELECT',
+            description: 'Choice the service image tag',
+            filterLength: 1,
+            filterable: true,
+            name: 'service_image_tag',
+            referencedParameters: 'service',
+            script: [$class: 'GroovyScript',
+                    fallbackScript: [classpath: [],
+                                    sandbox: false,
+                                    script: ''],
+                    script: [classpath: [],
+                            sandbox: false,
+                            script: '''
+                            import jenkins.model.*
+                            import groovy.json.*
+                            
+                            def creds = com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
+                                com.cloudbees.plugins.credentials.Credentials.class,
+                                Jenkins.getInstance().getItemByFullName("YOUR_PROJECT"),   // Project where will be searchinck of creds
+                                null,
+                                null
+                            );
+                            def credential = creds.find {it.id == 'docker-registry-credentials'}
+                            if (!credential) {
+                                println("Unable to pickup credential from Jenkins")
+                            }
+
+                            token = credential.password
+                            
+                            // if noone services is selected
+                            if (binding.hasVariable('service')) {
+                                println("if")
+                            } else {
+                                println("else")
+                                service = "php-app-1"
+                            }
+
+                            // Get all image tags from repo 
+                            def callGet(){
+                                def get = new URL("https://project-docker.artifactory.contoso.com/v2/"+ service +"/tags/list").openConnection()
+                                get.setRequestMethod("GET")
+                                get.setDoOutput(true)
+                                get.setRequestProperty("Authorization", "Bearer "+token)
+                                def getRC = get.getResponseCode();
+                                def response = get.getInputStream().getText()
+                                if(getRC.equals(200)) {
+                                    return response
+                                }
+                            }
+                            def main(){
+                                def json = new JsonSlurper().parseText(callGet())
+                                def data = json.tags.findAll{ it }
+                                return data
+                            }
+
+                            return main()
+                            '''
+                    ]
+            ]
+        ],
+        choice(choices: [ 'testing', 'preprod'], description: '', name: 'environment')
+    ])
+])
+
+if ( environment == "develop" ) {
+    environment = "preprod"
+}
+
+String command = "ansible-playbook " +
+        "-i environments/${environment}/inventory.ini " +
+        "./playbooks/${environment}/deploy-docker-services.yaml " +
+        "-t ${service} " +
+        "-e \" " +
+            "deploy_docker_service=${service} " +
+            "deploy_docker_image_tag=${service_image_tag} " +
+            "run_migrations=true " +
+            "ansible_user=r2d2" +
+        "\" " +
+        " --limit \"\$(./inventory-limit.py -H environments/${environment}/inventory.ini -t ${service})\""
+
+def docker_registry = ""
+String AGENT_LABEL = ""
+
+docker_registry = "project-docker.artifactory.contoso.com"
+if ( environment == "preprod" ) {
+    AGENT_LABEL = "project-prod"
+} else if ( environment == "stage" ) {
+    AGENT_LABEL = "project-stage"
+}
+
+def docker_image = docker.image("${docker_registry}/ansible:2.9-alpine-3.11")
+String build_status = "FAILED"
+String message = ""
+
+pipeline {
+    agent {
+        label "${AGENT_LABEL}"
+    }
+    stages {
+        stage('deploy') {
+            steps {
+                cleanWs()
+                script {
+                    checkout scm
+                    docker.withRegistry("https://${docker_registry}", "docker-registry-credentials") {
+                        docker_image.inside('-u 0 --network=host') {
+                            withCredentials([file(credentialsId: 'ansible-vault-password', variable: 'ansible_vault_password')]) {
+                                sh "mkdir ~/.ansible"
+                                sh "cp \$ansible_vault_password ~/.ansible/vault_password"
+                            }
+                            echo "${command}"
+                            echo "#####################################"
+                            sshagent(['ssh-r2d2']) {
+                                sh "${command}"
+                            }
+                        }
+                    }
+                    build_status = "SUCCESSFUL"
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                message = "🚀🚀 Service *${service}* from build *${service_image_tag}* " +
+                                "was deployed [${build_status}](${BUILD_URL}console) to *${environment}*"
+                if ( build_status == "SUCCESSFUL" ) {
+                    message = "${message} ✅✅"
+                    buildName "# ${BUILD_NUMBER} ${service} ${service_image_tag} ${environment}"
+                    buildDescription "Executed @ ${NODE_NAME}"
+                } else {
+                    message = "${message} 🛑🛑"
+                    currentBuild.displayName = 'This build is FAILED!!!'
+                }
+                telegramSend(message: "${message}", chatId: -123456789)
+            }
+        }
+    }
+}

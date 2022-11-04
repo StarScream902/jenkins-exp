@@ -1,0 +1,147 @@
+#!/usr/bin/env groovy
+
+import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
+
+properties([
+    pipelineTriggers([
+        [$class: 'ComputedFolderWebHookTrigger',
+        token: 'webhook-token-from-git']
+    ]),
+    [$class: 'JiraProjectProperty', siteName: 'https://jira.contoso.com/projects/PR/summary'],
+    buildDiscarder(logRotator(artifactDaysToKeepStr: '30', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '5')),
+    disableConcurrentBuilds(),
+    disableResume(),
+    [$class: 'RebuildSettings', autoRebuild: false, rebuildDisabled: false],
+    [$class: 'JobRestrictionProperty'],
+    parameters([
+        booleanParam(
+            defaultValue: false,
+            name: 'CUSTOM_DEPLOY',
+            description: 'Do you want to deploy this build?'
+        ),
+        choice(choices: ['testing', 'preprod'], description: '', name: 'environment')
+    ])
+])
+
+node('docker') {
+    notifyBitbucket(buildStatus: 'INPROGRESS')
+
+    cleanWs()
+
+    checkout scm
+
+    def docker_app_image
+
+    def docker_builder_image = docker.image("docker.artifactory.contoso.com/composer:2.1.11")
+
+    String build_status = ""
+
+    String service_name = "php-app"
+
+    String published_service_image_tag = ""
+
+    String branch_name = BRANCH_NAME.toLowerCase().replaceAll('\\/','-')
+
+    try {
+        if ( CUSTOM_DEPLOY ) {
+            println("CUSTOM_DEPLOY is defined")
+        }
+    } catch (Exception e) {
+        println("CUSTOM_DEPLOY is not defined")
+        CUSTOM_DEPLOY="false"
+    }
+
+    try {
+        docker.withRegistry('https://docker.artifactory.contoso.com', 'jenkins-secret-for-docker-registry') {
+            stage('Installing the requirements') {
+                docker_builder_image.inside('-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -v $HOME:$HOME') {
+                    sshagent(['jenkins-secret-ssh-agent-for-git']) { // It needs because composer will pull some dependencies from private git repo
+                        sh 'cp .env.example .env'
+                        sh 'composer install --ignore-platform-reqs'
+                        sh 'rm -f .env'
+                    }
+                }
+            }
+
+            stage('Running unit tests') {
+                docker_builder_image.inside('-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -v $HOME:$HOME') {
+                    sh 'cp .env.example .env'
+                    sh 'vendor/bin/codecept run unit'
+                    sh 'rm -f .env'
+                }
+            }
+
+            stage('Building docker image') {
+                docker_app_image = docker.build("project-docker.artifactory.contoso.com/${service_name}:${branch_name}-latest")
+            }
+
+            stage('Running tests platform requirements') {
+                docker_app_image.inside("-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -v $HOME:$HOME --entrypoint=''") {
+                    sh 'cp .env.example .env'
+                    sh "php -r \"copy('https://getcomposer.org/installer', 'composer-setup.php');\""
+                    sh "php -r \"if (hash_file('sha384', 'composer-setup.php') === '906a84df04cea2aa72f40b5f787e49f22d4c2f19492ac310e8cba5b96ac8b64115ac402c8cd292b8a03482574915d1a8') { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;\""
+                    sh "php composer-setup.php"
+                    sh "php -r \"unlink('composer-setup.php');\""
+                    sh "./composer.phar install"
+                    // sh 'composer install'
+                    sh 'rm -f .env'
+                }
+            }
+        }
+
+        docker.withRegistry('https://project-docker.artifactory.contoso.com', 'jenkins-secret-for-docker-registry') {
+            stage('Publish') {
+                if ( BRANCH_NAME == "develop" || BRANCH_NAME == "master" ) {
+                    docker_app_image.push()
+                    docker_app_image.push("${branch_name}-${BUILD_NUMBER}")
+                    published_service_image_tag = "${branch_name}-${BUILD_NUMBER}"
+                } else if ( BRANCH_NAME =~ "release" || CUSTOM_DEPLOY == "true" ) {
+                    docker_app_image.push()
+                    published_service_image_tag = "${branch_name}-latest"
+                } else {
+                    Utils.markStageSkippedForConditional(STAGE_NAME)
+                }
+            }
+        }
+
+        // Uncomment this block if deploy is exist
+        stage('Runing deploy'){
+            if ( BRANCH_NAME == "develop" || BRANCH_NAME =~ "release" || CUSTOM_DEPLOY == "true" ) {
+                if ( BRANCH_NAME =~ "release" && CUSTOM_DEPLOY == "false" ) {
+                    environment = "preprod"
+                }
+                build(
+                    job: 'deploy-develop',
+                    propagate: true, wait: false,
+                    parameters: [
+                        string(name: 'service', value: "${service_name}"),
+                        string(name: 'environment', value: "${environment}"),
+                        string(name: 'service_image_tag', value: "${published_service_image_tag}")
+                    ]
+                )
+            } else {
+                Utils.markStageSkippedForConditional(STAGE_NAME)
+            }
+        }
+
+        build_status = "SUCCESSFUL"
+
+    } catch (e) {
+        build_status = "FAILED"
+        throw e
+    } finally {
+        String message = "🛠🛠 Service *${service_name}* from branch *${BRANCH_NAME}* " +
+                            "and build number *${BUILD_NUMBER}* was built with status " +
+                            "[${build_status}](${BUILD_URL}console)"
+        if ( build_status == "SUCCESSFUL" ) {
+            message = "${message} 🟢🟢"
+            if ( published_service_image_tag != "" ) {
+                message = "${message} and published with docker image tag *${published_service_image_tag}*"
+            }
+        } else {
+            message = "${message} 🔴🔴"
+        }
+        notifyBitbucket(buildStatus: "${build_status}")
+        telegramSend(message: "${message}", chatId: -1234567894944)
+    }
+}
